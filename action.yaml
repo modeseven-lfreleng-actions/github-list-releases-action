@@ -1,58 +1,58 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2024 The Linux Foundation
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 # github-list-releases-action
 name: "📦 List GitHub Releases"
 description: "Returns a list of releases for a GitHub repository"
-# Limited to 1000 records due to GitHub API query limits
-# 640K ought to be enough for anybody
-# ToDo: investigate support for API query pagination
 
 inputs:
   # Optional
-  TAG:
-    description: "Check if this tag/version has been released"
-    required: false
-  SUMMARY_OUTPUT:
-    description: "Displays summary output"
-    required: false
-    default: "false"
-  PRODUCTION_ONLY:
-    description: "Pre-release and draft releases are included"
-    required: false
-    default: "false"
-  RETURN_TYPE:
-    description: "Set to either: text|json"
-    required: false
-    default: "text"
-  JSON_FIELDS:
-    # Mandatory when return type (above) is set to JSON
-    description: "Fields to return when return type set to JSON"
-    required: false
-    default: "tagName"
-  ORDER:
-    description: "Sort order: asc|desc"
-    required: false
-    default: "desc"
-  REPOSITORY:
+  repository:
     description: "Target repository in owner/name form (defaults to current)"
     required: false
-    default: ${{ github.repository }}
-  GITHUB_TOKEN:
+    default: ""
+  tag:
+    description: "Check if this tag/version has been released"
+    required: false
+    default: ""
+  summary_output:
+    description: "When true, writes summary output to the GitHub step summary"
+    required: false
+    default: "false"
+  production_only:
+    description: "When true, exclude pre-release and draft releases"
+    required: false
+    default: "false"
+  return_type:
+    description: "Output format for the releases list: text or json"
+    required: false
+    default: "text"
+  json_fields:
+    # Used when return_type=json; defaults to tagName
+    description: "Fields returned when return_type is json (default tagName)"
+    required: false
+    default: "tagName"
+  order:
+    description: "Sort order: asc or desc"
+    required: false
+    default: "desc"
+  limit:
+    description: "Maximum number of releases to fetch (positive integer)"
+    required: false
+    default: "1000"
+  token:
     description: "GitHub token used to authenticate the GitHub CLI"
     required: false
-    default: ${{ github.token }}
+    default: ""
 
 outputs:
-  # Mandatory
-  RELEASES:
-    description: "List of releases in specified output format"
+  releases:
+    description: "List of releases in the requested output format"
     value: ${{ steps.releases.outputs.releases }}
-  # Optional
-  RELEASED:
-    description: "Has provided tag/version already been released"
-    value: ${{ steps.releases.outputs.tag }}
+  released:
+    description: "Whether the provided tag/version has already been released"
+    value: ${{ steps.releases.outputs.released }}
 
 runs:
   using: "composite"
@@ -61,123 +61,256 @@ runs:
       id: releases
       shell: bash
       env:
-        GH_TOKEN: ${{ inputs.GITHUB_TOKEN }}
+        # Use the caller-supplied token when provided, otherwise fall back
+        # to the automatic workflow token. Input defaults cannot safely
+        # reference ${{ github.token }} from composite actions, so the
+        # fallback is evaluated here at step runtime.
+        GH_TOKEN: ${{ inputs.token != '' && inputs.token || github.token }}
+        INPUT_REPOSITORY: ${{ inputs.repository }}
+        INPUT_TAG: ${{ inputs.tag }}
+        INPUT_SUMMARY_OUTPUT: ${{ inputs.summary_output }}
+        INPUT_PRODUCTION_ONLY: ${{ inputs.production_only }}
+        INPUT_RETURN_TYPE: ${{ inputs.return_type }}
+        INPUT_JSON_FIELDS: ${{ inputs.json_fields }}
+        INPUT_ORDER: ${{ inputs.order }}
+        INPUT_LIMIT: ${{ inputs.limit }}
+        DEFAULT_REPOSITORY: ${{ github.repository }}
       run: |
         # List GitHub Releases
+        set -euo pipefail
 
-        # Check GitHub CLI is available
-        GH_CLI=$(which gh)
-        if [ ! -x "$GH_CLI" ]; then
-          echo "Error: GitHub CLI was NOT found in PATH ❌"
+        # Detect GitHub CLI without triggering set -e on failure
+        GH_CLI=$(command -v gh || true)
+        if [ -z "$GH_CLI" ] || [ ! -x "$GH_CLI" ]; then
+          echo "Error: GitHub CLI (gh) was NOT found in PATH ❌"
           exit 1
         fi
 
-        # Function to check releases
-        checkReleases() {
-          while IFS= read -r RELEASE ; do
-          if [ "$RELEASE" = "$TAG" ]; then
-            RELEASED="true"
-          fi
-          done <<< "$RELEASES"
-        }
+        # Case-insensitive normalisation of inputs. Use printf to avoid
+        # echo's inconsistent handling of leading -n / -e.
+        SUMMARY_OUTPUT=$(printf '%s' "$INPUT_SUMMARY_OUTPUT" |\
+          tr '[:upper:]' '[:lower:]')
+        PRODUCTION_ONLY=$(printf '%s' "$INPUT_PRODUCTION_ONLY" |\
+          tr '[:upper:]' '[:lower:]')
+        RETURN_TYPE=$(printf '%s' "$INPUT_RETURN_TYPE" |\
+          tr '[:upper:]' '[:lower:]')
+        ORDER=$(printf '%s' "$INPUT_ORDER" |\
+          tr '[:upper:]' '[:lower:]')
+        TAG="$INPUT_TAG"
+        JSON_FIELDS="$INPUT_JSON_FIELDS"
+        LIMIT="$INPUT_LIMIT"
+        REPOSITORY="$INPUT_REPOSITORY"
 
-        # Case-insensitive matching of inputs
-        SUMMARY_OUTPUT=$(echo ${{ inputs.summary_output }} |\
-          tr '[:upper:]' '[:lower:]')
-        PRODUCTION_ONLY=$(echo ${{ inputs.PRODUCTION_ONLY }} |\
-          tr '[:upper:]' '[:lower:]')
-        RETURN_TYPE=$(echo ${{ inputs.return_type }} |\
-          tr '[:upper:]' '[:lower:]')
-        ORDER=$(echo ${{ inputs.order }} |\
-          tr '[:upper:]' '[:lower:]')
-        TAG="${{ inputs.tag }}"
-        REPOSITORY="${{ inputs.REPOSITORY }}"
-
-        # Validate repository input (owner/name)
+        # Default REPOSITORY to the workflow's repository when not set.
+        # This avoids requiring an explicit actions/checkout in the caller
+        # workflow and gives gh an unambiguous --repo target.
         if [ -z "$REPOSITORY" ]; then
-          echo "Error: REPOSITORY input is empty ❌"
-          exit 1
+          REPOSITORY="$DEFAULT_REPOSITORY"
         fi
+
+        # Validate repository (owner/name) to prevent shell metacharacter
+        # injection when the value is placed on the gh command line.
         REPO_RE='^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'
-        if ! echo "$REPOSITORY" | grep -Eq "$REPO_RE"; then
-          echo "Error: REPOSITORY must be in 'owner/name' form ❌"
+        if ! printf '%s' "$REPOSITORY" | grep -Eq "$REPO_RE"; then
+          echo "Error: repository must be in 'owner/name' form ❌"
           echo "Received: $REPOSITORY"
           exit 1
         fi
-        echo "Target repository: $REPOSITORY"
 
-        # Set baseline flags for the CLI command
-        # Note: limit MUST be provided numerically to GH CLI
-        # --repo targets an arbitrary repository via the GitHub API and
-        # does NOT require the repository to be checked out locally
-        CLI_FLAGS="release list --repo $REPOSITORY --limit 1000 -O $ORDER"
-
-        if [ "f$PRODUCTION_ONLY" = "ffalse" ]; then
-          CLI_FLAGS="$CLI_FLAGS --exclude-drafts --exclude-pre-releases"
+        # Validate return_type
+        if [ "$RETURN_TYPE" != "text" ] && [ "$RETURN_TYPE" != "json" ]; then
+          echo "Error: return_type must be 'text' or 'json' ❌"
+          echo "Received: $RETURN_TYPE"
+          exit 1
         fi
 
-        # Check dependent input parameters are coherent
-        if [ "$RETURN_TYPE" = "json" ] && [ -z "$JSON_FIELDS" ]; then
-          echo "Error: fields MUST be specified when return type is JSON ❌"
+        # Validate order
+        if [ "$ORDER" != "asc" ] && [ "$ORDER" != "desc" ]; then
+          echo "Error: order must be 'asc' or 'desc' ❌"
+          echo "Received: $ORDER"
           exit 1
-        elif [ "$RETURN_TYPE" = "json" ]; then
-          CLI_FLAGS="$CLI_FLAGS --json ${{ inputs.JSON_FIELDS }}"
+        fi
+
+        # Validate limit (positive integer)
+        if ! printf '%s' "$LIMIT" | grep -Eq '^[1-9][0-9]*$'; then
+          echo "Error: limit must be a positive integer ❌"
+          echo "Received: $LIMIT"
+          exit 1
+        fi
+
+        # Validate json_fields when JSON output is requested. The regex
+        # rejects empty segments (leading/trailing/consecutive commas)
+        # and restricts fields to an alphabetic allow-list, preventing
+        # shell injection through this CLI argument.
+        if [ "$RETURN_TYPE" = "json" ]; then
+          if [ -z "$JSON_FIELDS" ]; then
+            echo "Error: json_fields must be set when return_type is json ❌"
+            exit 1
+          fi
+          if ! printf '%s' "$JSON_FIELDS" |\
+              grep -Eq '^[A-Za-z]+(,[A-Za-z]+)*$'; then
+            echo "Error: json_fields must be a comma-separated list of" \
+              "alphabetic field names ❌"
+            echo "Received: $JSON_FIELDS"
+            exit 1
+          fi
+        fi
+
+        echo "Target repository: $REPOSITORY"
+
+        # checkReleases iterates newline-delimited tag names in $RELEASES
+        # and sets RELEASED=true on the first match, breaking out early
+        # to avoid scanning unnecessary entries.
+        checkReleases() {
+          while IFS= read -r RELEASE; do
+            if [ "$RELEASE" = "$TAG" ]; then
+              RELEASED="true"
+              break
+            fi
+          done <<< "$RELEASES"
+        }
+
+        # Build base CLI arguments as an array so every element is passed
+        # to gh as a single, quoted argv entry. This eliminates any
+        # word-splitting/globbing risk from user-controlled inputs.
+        CLI_FLAGS=(release list
+          --repo "$REPOSITORY"
+          --limit "$LIMIT"
+          --order "$ORDER")
+
+        if [ "$PRODUCTION_ONLY" = "true" ]; then
+          CLI_FLAGS+=(--exclude-drafts --exclude-pre-releases)
+        fi
+
+        if [ "$RETURN_TYPE" = "json" ]; then
+          CLI_FLAGS+=(--json "$JSON_FIELDS")
         fi
 
         echo "Fetching GitHub Releases 📦"
-        if [ "f$SUMMARY_OUTPUT" = "ftrue" ]; then
+        if [ "$SUMMARY_OUTPUT" = "true" ]; then
           echo "### 📦 GitHub List Releases" >> "$GITHUB_STEP_SUMMARY"
         fi
 
-        # Run and capture GitHub CLI Command
+        # Initialise payload variables up-front to satisfy set -u on the
+        # various code paths below.
+        RELEASES=""
+        RELEASES_JSON=""
+
+        # Run and capture GitHub CLI command. When return_type=text the
+        # primary payload is the newline-delimited tag list; when json,
+        # the primary payload is the raw JSON and we also fetch tag
+        # names separately (only when needed for tag checking) so that
+        # checkReleases has a consistent format to iterate over.
         if [ "$RETURN_TYPE" = "text" ]; then
-          # Text output is actually a JSON query processed with fixed arguments
-          echo "Running: $GH_CLI $CLI_FLAGS"
-          RELEASES=$($GH_CLI $CLI_FLAGS --json tagName -q '.[] | .tagName')
+          echo "Running: $GH_CLI ${CLI_FLAGS[*]} --json tagName" \
+            "-q '.[] | .tagName'"
+          RELEASES=$("$GH_CLI" "${CLI_FLAGS[@]}" \
+            --json tagName -q '.[] | .tagName')
         else
-          echo "Running: $GH_CLI $CLI_FLAGS"
-          RELEASES=$($GH_CLI $CLI_FLAGS)
+          echo "Running: $GH_CLI ${CLI_FLAGS[*]}"
+          RELEASES_JSON=$("$GH_CLI" "${CLI_FLAGS[@]}")
+          if [ -n "$TAG" ]; then
+            # Mirror the filtering applied to CLI_FLAGS so the released
+            # flag is consistent with the visible release list.
+            TAG_FLAGS=(release list
+              --repo "$REPOSITORY"
+              --limit "$LIMIT"
+              --order "$ORDER")
+            if [ "$PRODUCTION_ONLY" = "true" ]; then
+              TAG_FLAGS+=(--exclude-drafts --exclude-pre-releases)
+            fi
+            echo "Running (for tag matching): $GH_CLI ${TAG_FLAGS[*]}" \
+              "--json tagName -q '.[] | .tagName'"
+            RELEASES=$("$GH_CLI" "${TAG_FLAGS[@]}" \
+              --json tagName -q '.[] | .tagName')
+          fi
         fi
 
-        # Only list releases if/when values are returned
-        if [ -n "$RELEASES" ]; then
-          echo "Releases in repository $REPOSITORY:"
-          echo "$RELEASES"
+        # Log a concise summary instead of dumping the entire payload,
+        # which can be very large when limit is high.
+        if [ "$RETURN_TYPE" = "json" ]; then
+          echo "Releases fetched from $REPOSITORY" \
+            "(JSON output suppressed in logs; full payload in action output)"
+        else
+          if [ -n "$RELEASES" ]; then
+            RELEASE_COUNT=$(printf '%s\n' "$RELEASES" | wc -l | tr -d ' ')
+            echo "Releases fetched from $REPOSITORY: $RELEASE_COUNT"
+            echo "First 10 releases:"
+            printf '%s\n' "$RELEASES" | head -n 10
+          else
+            echo "No releases found in $REPOSITORY"
+          fi
         fi
+
+        # Select the user-facing payload and export it via a heredoc
+        # with a collision-resistant delimiter so the output cannot be
+        # truncated by a payload line that happens to equal 'EOF'.
+        if [ "$RETURN_TYPE" = "json" ]; then
+          OUTPUT_VALUE="$RELEASES_JSON"
+        else
+          OUTPUT_VALUE="$RELEASES"
+        fi
+
+        OUTPUT_DELIMITER="RELEASES_EOF_$$_${RANDOM}_${RANDOM}"
+        while printf '%s\n' "$OUTPUT_VALUE" |\
+            grep -Fqx "$OUTPUT_DELIMITER"; do
+          OUTPUT_DELIMITER="RELEASES_EOF_$$_${RANDOM}_${RANDOM}"
+        done
+        printf 'releases<<%s\n' "$OUTPUT_DELIMITER" >> "$GITHUB_OUTPUT"
+        if [ -n "$OUTPUT_VALUE" ]; then
+          printf '%s\n' "$OUTPUT_VALUE" >> "$GITHUB_OUTPUT"
+        fi
+        printf '%s\n' "$OUTPUT_DELIMITER" >> "$GITHUB_OUTPUT"
+
+        # Initialise RELEASED to a stable boolean so callers always
+        # receive either "true" or "false", never an empty string.
+        RELEASED="false"
 
         if [ -z "$TAG" ]; then
-          # Exit early if no tag/version to check in releases
+          # No tag to check; export the default released and exit.
+          # Only the step output is written; GITHUB_ENV is deliberately
+          # not touched to avoid leaking a generic variable name into
+          # the caller's job environment.
+          echo "released=$RELEASED" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
-        # Check with leading character in place
+        # Check exactly as provided first, then try the alternate
+        # v-prefixed / unprefixed form if the first pass did not match.
+        # The original TAG is preserved so log messages and the summary
+        # reflect what the caller actually supplied.
+        ORIGINAL_TAG="$TAG"
         echo "Checking for: $TAG"
         checkReleases
 
         if [ "$RELEASED" != "true" ]; then
-          if [[ "$TAG" == v* ]]; then
-            TAG="${TAG:1}"
-            # Check again with leading 'v' character stripped
+          if [[ "$ORIGINAL_TAG" == v* ]]; then
+            ALT_TAG="${ORIGINAL_TAG:1}"
+          else
+            ALT_TAG="v$ORIGINAL_TAG"
+          fi
+          if [ "$ALT_TAG" != "$ORIGINAL_TAG" ]; then
+            TAG="$ALT_TAG"
             echo "Checking for: $TAG"
             checkReleases
+            TAG="$ORIGINAL_TAG"
           fi
         fi
 
-        # Set output value
-        echo "RELEASED=$RELEASED" >> "$GITHUB_ENV"
-        echo "RELEASED=$RELEASED" >> "$GITHUB_OUTPUT"
+        echo "released=$RELEASED" >> "$GITHUB_OUTPUT"
 
         if [ "$RELEASED" = "true" ]; then
-          echo "${{ inputs.tag }} HAS already been release ⚠️"
+          echo "$ORIGINAL_TAG HAS already been released ⚠️"
         else
-          echo "${{ inputs.tag }} has not previously been released ✅"
+          echo "$ORIGINAL_TAG has not previously been released ✅"
         fi
-        if [ "f$SUMMARY_OUTPUT" = "ftrue" ]; then
+
+        if [ "$SUMMARY_OUTPUT" = "true" ]; then
           if [ "$RELEASED" = "true" ]; then
-            echo "Release already published: $TAG ⚠️" \
+            echo "Release already published: $ORIGINAL_TAG ⚠️" \
               >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "Release not published yet: $TAG ✅" \
+            echo "Release not published yet: $ORIGINAL_TAG ✅" \
               >> "$GITHUB_STEP_SUMMARY"
           fi
         fi

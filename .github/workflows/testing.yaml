@@ -19,6 +19,14 @@ concurrency:
 
 permissions: {}
 
+# The tests below query a dedicated external fixture repository that
+# contains a stable set of releases (including at least one unprefixed
+# tag such as 0.1.0). Using a fixture repo keeps the assertions
+# deterministic without requiring the CI job to create/destroy
+# repositories or releases.
+env:
+  FIXTURE_REPO: "lfreleng-actions/test-python-project"
+
 jobs:
   ### Test the GitHub Action in this Repository ###
   tests:
@@ -26,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    timeout-minutes: 10 # Increase this timeout value as needed
+    timeout-minutes: 10
     steps:
       # Harden the runner used by this workflow
       # yamllint disable-line rule:line-length
@@ -37,47 +45,457 @@ jobs:
       - name: "Checkout repository"
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      # Perform setup prior to running test(s)
-      - name: "Testing setup step"
-        shell: bash
-        run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: "Running local action: ${{ github.repository }}"
+      # ---------------------------------------------------------------
+      # 1. Default inputs: current repo, text mode, no tag.
+      #    Exercises the default-token fallback (no token input passed).
+      # ---------------------------------------------------------------
+      - name: "Test: default inputs against current repository"
+        id: defaults
         uses: ./
         with:
-          SUMMARY_OUTPUT: "true"
+          summary_output: "true"
 
-      - name: "Validated local action: ${{ github.repository }}"
+      - name: "Validate: default inputs"
         shell: bash
+        env:
+          RELEASES: ${{ steps.defaults.outputs.releases }}
+          RELEASED: ${{ steps.defaults.outputs.released }}
         run: |
-          # Local action validation
-          echo "Validated local action: ${{ github.repository }}"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Validate default-inputs outputs
+          set -euo pipefail
+          # With no tag input, released must be the literal string "false"
+          if [ "$RELEASED" != "false" ]; then
+            echo "❌ Expected released=false when no tag provided"
+            echo "Got: released='$RELEASED'"
+            exit 1
+          fi
+          echo "✅ released=false when no tag provided"
+          # releases may be empty for this repo (pre-release); just print
+          echo "releases output (first 5 lines):"
+          printf '%s\n' "$RELEASES" | head -n 5 || true
 
-      # Test targeting a remote repository (no checkout required).
-      # The target repository is public and has stable, tagged releases.
-      - name: "Running local action against remote repository"
-        id: remote
+      # ---------------------------------------------------------------
+      # 2. Remote repository, text mode, no tag.
+      #    Asserts that releases are returned for a repo we do not
+      #    check out locally.
+      # ---------------------------------------------------------------
+      - name: "Test: remote repository in text mode"
+        id: remote_text
         uses: ./
         with:
-          REPOSITORY: "lfreleng-actions/test-python-project"
-          SUMMARY_OUTPUT: "true"
+          repository: ${{ env.FIXTURE_REPO }}
 
-      # Negative test: malformed REPOSITORY input must fail fast
-      - name: "Running local action with invalid REPOSITORY"
-        id: remote_failure
+      - name: "Validate: remote repository text output"
+        shell: bash
+        env:
+          RELEASES: ${{ steps.remote_text.outputs.releases }}
+          RELEASED: ${{ steps.remote_text.outputs.released }}
+        run: |
+          # Validate remote repository text output
+          set -euo pipefail
+          if [ -z "$RELEASES" ]; then
+            echo "❌ Expected non-empty releases from fixture repository"
+            exit 1
+          fi
+          if [ "$RELEASED" != "false" ]; then
+            echo "❌ Expected released=false (no tag provided)"
+            echo "Got: released='$RELEASED'"
+            exit 1
+          fi
+          echo "✅ Remote repository text output populated"
+          printf '%s\n' "$RELEASES" | head -n 5
+
+      # ---------------------------------------------------------------
+      # 3. Remote repository, JSON mode with multiple fields.
+      #    Asserts valid JSON containing the requested fields.
+      # ---------------------------------------------------------------
+      - name: "Test: remote repository in JSON mode"
+        id: remote_json
+        uses: ./
+        with:
+          repository: ${{ env.FIXTURE_REPO }}
+          return_type: "json"
+          json_fields: "tagName,publishedAt"
+
+      - name: "Validate: remote repository JSON output"
+        shell: bash
+        env:
+          RELEASES: ${{ steps.remote_json.outputs.releases }}
+        run: |
+          # Validate remote repository JSON output
+          set -euo pipefail
+          if [ -z "$RELEASES" ]; then
+            echo "❌ Expected non-empty JSON payload"
+            exit 1
+          fi
+          # Must parse as JSON and contain requested fields
+          echo "$RELEASES" | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          if not isinstance(data, list) or not data:
+              print("❌ Expected non-empty JSON array"); sys.exit(1)
+          first = data[0]
+          for field in ("tagName", "publishedAt"):
+              if field not in first:
+                  print(f"❌ Missing field {field!r} in JSON output")
+                  sys.exit(1)
+          print(f"✅ JSON output parses as list of {len(data)} releases")
+          '
+
+      # ---------------------------------------------------------------
+      # 4. Tag checking: an unprefixed tag that exists with a v-prefix
+      #    in the fixture repo. Validates bidirectional matching.
+      #    v0.1.1 is a published (non-draft) release in the fixture repo.
+      # ---------------------------------------------------------------
+      - name: "Test: unprefixed tag matches v-prefixed release"
+        id: tag_unprefixed
+        uses: ./
+        with:
+          repository: ${{ env.FIXTURE_REPO }}
+          tag: "0.1.1"
+
+      - name: "Validate: unprefixed tag matching"
+        shell: bash
+        env:
+          RELEASED: ${{ steps.tag_unprefixed.outputs.released }}
+        run: |
+          # Validate unprefixed tag matching
+          set -euo pipefail
+          if [ "$RELEASED" != "true" ]; then
+            echo "❌ Expected released=true for unprefixed tag 0.1.1"
+            echo "Got: released='$RELEASED'"
+            exit 1
+          fi
+          echo "✅ Unprefixed tag 0.1.1 matched v-prefixed release"
+
+      # ---------------------------------------------------------------
+      # 5. Tag checking: v-prefixed form of the same tag.
+      # ---------------------------------------------------------------
+      - name: "Test: v-prefixed tag matches directly"
+        id: tag_prefixed
+        uses: ./
+        with:
+          repository: ${{ env.FIXTURE_REPO }}
+          tag: "v0.1.1"
+
+      - name: "Validate: v-prefixed tag matching"
+        shell: bash
+        env:
+          RELEASED: ${{ steps.tag_prefixed.outputs.released }}
+        run: |
+          # Validate v-prefixed tag matching
+          set -euo pipefail
+          if [ "$RELEASED" != "true" ]; then
+            echo "❌ Expected released=true for v-prefixed tag v0.1.1"
+            echo "Got: released='$RELEASED'"
+            exit 1
+          fi
+          echo "✅ v-prefixed tag v0.1.1 matched directly"
+
+      # ---------------------------------------------------------------
+      # 6. Tag checking: a tag that definitely does not exist.
+      #    Asserts released equals literal "false".
+      # ---------------------------------------------------------------
+      - name: "Test: non-existent tag returns released=false"
+        id: tag_missing
+        uses: ./
+        with:
+          repository: ${{ env.FIXTURE_REPO }}
+          tag: "v99.99.99-does-not-exist"
+
+      - name: "Validate: non-existent tag handling"
+        shell: bash
+        env:
+          RELEASED: ${{ steps.tag_missing.outputs.released }}
+        run: |
+          # Validate non-existent tag handling
+          set -euo pipefail
+          if [ "$RELEASED" != "false" ]; then
+            echo "❌ Expected released=false for non-existent tag"
+            echo "Got: released='$RELEASED'"
+            exit 1
+          fi
+          echo "✅ Non-existent tag correctly returns released=false"
+
+      # ---------------------------------------------------------------
+      # 7. Tag checking in JSON mode: makes sure the second (tag-name)
+      #    query path works correctly and released is populated.
+      # ---------------------------------------------------------------
+      - name: "Test: tag checking in JSON mode"
+        id: tag_json
+        uses: ./
+        with:
+          repository: ${{ env.FIXTURE_REPO }}
+          tag: "v0.1.1"
+          return_type: "json"
+          json_fields: "tagName,publishedAt"
+
+      - name: "Validate: tag checking in JSON mode"
+        shell: bash
+        env:
+          RELEASED: ${{ steps.tag_json.outputs.released }}
+          RELEASES: ${{ steps.tag_json.outputs.releases }}
+        run: |
+          # Validate tag checking in JSON mode
+          set -euo pipefail
+          if [ "$RELEASED" != "true" ]; then
+            echo "❌ Expected released=true for v0.1.1 in JSON mode"
+            echo "Got: released='$RELEASED'"
+            exit 1
+          fi
+          if ! echo "$RELEASES" |\
+              python3 -c 'import json,sys; json.load(sys.stdin)'; then
+            echo "❌ releases output is not valid JSON"
+            exit 1
+          fi
+          echo "✅ Tag checking works in JSON mode with valid JSON payload"
+
+      # ---------------------------------------------------------------
+      # 8. Sort order: asc vs desc on the same repo must differ.
+      # ---------------------------------------------------------------
+      - name: "Test: ascending sort order"
+        id: order_asc
+        uses: ./
+        with:
+          repository: ${{ env.FIXTURE_REPO }}
+          order: "asc"
+
+      - name: "Test: descending sort order"
+        id: order_desc
+        uses: ./
+        with:
+          repository: ${{ env.FIXTURE_REPO }}
+          order: "desc"
+
+      - name: "Validate: sort orders produce opposite first entries"
+        shell: bash
+        env:
+          ASC: ${{ steps.order_asc.outputs.releases }}
+          DESC: ${{ steps.order_desc.outputs.releases }}
+        run: |
+          # Validate sort order behaviour
+          set -euo pipefail
+          ASC_FIRST=$(printf '%s\n' "$ASC" | head -n 1)
+          DESC_FIRST=$(printf '%s\n' "$DESC" | head -n 1)
+          ASC_LAST=$(printf '%s\n' "$ASC" | tail -n 1)
+          DESC_LAST=$(printf '%s\n' "$DESC" | tail -n 1)
+          echo "asc  first=$ASC_FIRST  last=$ASC_LAST"
+          echo "desc first=$DESC_FIRST last=$DESC_LAST"
+          # Only meaningful when the repo has >1 release
+          if [ -n "$ASC_FIRST" ] && [ -n "$DESC_FIRST" ] \
+              && [ "$ASC_FIRST" != "$ASC_LAST" ]; then
+            if [ "$ASC_FIRST" = "$DESC_FIRST" ]; then
+              echo "❌ asc and desc first entries should differ"
+              exit 1
+            fi
+            if [ "$ASC_FIRST" != "$DESC_LAST" ]; then
+              echo "❌ asc first should equal desc last (reverse order)"
+              exit 1
+            fi
+            echo "✅ asc/desc ordering is consistent"
+          else
+            echo "ℹ️ Fixture repo has <2 releases; order check skipped"
+          fi
+
+      # ---------------------------------------------------------------
+      # 9. Limit input: fetch at most N releases.
+      # ---------------------------------------------------------------
+      - name: "Test: limit caps the number of releases"
+        id: limited
+        uses: ./
+        with:
+          repository: ${{ env.FIXTURE_REPO }}
+          limit: "2"
+
+      - name: "Validate: limit is honoured"
+        shell: bash
+        env:
+          RELEASES: ${{ steps.limited.outputs.releases }}
+        run: |
+          # Validate limit is honoured
+          set -euo pipefail
+          if [ -z "$RELEASES" ]; then
+            echo "❌ Expected at least one release with limit=2"
+            exit 1
+          fi
+          COUNT=$(printf '%s\n' "$RELEASES" | wc -l | tr -d ' ')
+          if [ "$COUNT" -gt 2 ]; then
+            echo "❌ Expected <=2 releases with limit=2, got $COUNT"
+            exit 1
+          fi
+          echo "✅ limit=2 returned $COUNT release(s)"
+
+      # ---------------------------------------------------------------
+      # 10. Production-only filter: drafts/pre-releases must be excluded
+      #     when visible in the unfiltered output. v0.2.0 is a draft in
+      #     the fixture repo; the check is conditional so the test does
+      #     not fail if the token cannot see drafts.
+      # ---------------------------------------------------------------
+      - name: "Test: unfiltered list (to discover draft visibility)"
+        id: unfiltered
+        uses: ./
+        with:
+          repository: ${{ env.FIXTURE_REPO }}
+          production_only: "false"
+
+      - name: "Test: production_only excludes drafts/pre-releases"
+        id: production_only
+        uses: ./
+        with:
+          repository: ${{ env.FIXTURE_REPO }}
+          production_only: "true"
+
+      - name: "Validate: production_only filtering"
+        shell: bash
+        env:
+          UNFILTERED: ${{ steps.unfiltered.outputs.releases }}
+          FILTERED: ${{ steps.production_only.outputs.releases }}
+        run: |
+          # Validate production_only filtering
+          set -euo pipefail
+          if [ -z "$FILTERED" ]; then
+            echo "❌ Expected at least one production release in filtered output"
+            exit 1
+          fi
+          # Only assert draft exclusion if the unfiltered run saw the
+          # draft tag. Otherwise the token cannot see drafts and the
+          # assertion would be vacuously satisfied anyway.
+          DRAFT_TAG="v0.2.0"
+          if printf '%s\n' "$UNFILTERED" | grep -Fxq "$DRAFT_TAG"; then
+            if printf '%s\n' "$FILTERED" | grep -Fxq "$DRAFT_TAG"; then
+              echo "❌ $DRAFT_TAG should be excluded by production_only=true"
+              exit 1
+            fi
+            echo "✅ Draft tag $DRAFT_TAG correctly excluded"
+          else
+            echo "ℹ️ Draft $DRAFT_TAG not visible to token; check skipped"
+          fi
+
+      # ---------------------------------------------------------------
+      # 11. Negative: invalid repository must fail fast.
+      # ---------------------------------------------------------------
+      - name: "Test: invalid repository input"
+        id: bad_repo
         uses: ./
         continue-on-error: true
         with:
-          REPOSITORY: "not-a-valid-repo-string"
+          repository: "not-a-valid-repo-string"
 
-      - name: "Error if invalid REPOSITORY step did NOT fail"
-        if: steps.remote_failure.outcome == 'success'
+      - name: "Validate: invalid repository was rejected"
+        if: steps.bad_repo.outcome == 'success'
         shell: bash
         run: |
-          # Error if invalid REPOSITORY step did NOT fail
-          echo "Error: invalid REPOSITORY input did NOT fail ❌"
+          # Invalid repository should have failed
+          echo "❌ Expected invalid repository input to fail"
           exit 1
+
+      # ---------------------------------------------------------------
+      # 12. Negative: invalid return_type must fail fast.
+      # ---------------------------------------------------------------
+      - name: "Test: invalid return_type input"
+        id: bad_return_type
+        uses: ./
+        continue-on-error: true
+        with:
+          repository: ${{ env.FIXTURE_REPO }}
+          return_type: "yaml"
+
+      - name: "Validate: invalid return_type was rejected"
+        if: steps.bad_return_type.outcome == 'success'
+        shell: bash
+        run: |
+          # Invalid return_type should have failed
+          echo "❌ Expected invalid return_type to fail"
+          exit 1
+
+      # ---------------------------------------------------------------
+      # 13. Negative: invalid order must fail fast.
+      # ---------------------------------------------------------------
+      - name: "Test: invalid order input"
+        id: bad_order
+        uses: ./
+        continue-on-error: true
+        with:
+          repository: ${{ env.FIXTURE_REPO }}
+          order: "sideways"
+
+      - name: "Validate: invalid order was rejected"
+        if: steps.bad_order.outcome == 'success'
+        shell: bash
+        run: |
+          # Invalid order should have failed
+          echo "❌ Expected invalid order to fail"
+          exit 1
+
+      # ---------------------------------------------------------------
+      # 14. Negative: invalid limit must fail fast.
+      # ---------------------------------------------------------------
+      - name: "Test: invalid limit input"
+        id: bad_limit
+        uses: ./
+        continue-on-error: true
+        with:
+          repository: ${{ env.FIXTURE_REPO }}
+          limit: "zero"
+
+      - name: "Validate: invalid limit was rejected"
+        if: steps.bad_limit.outcome == 'success'
+        shell: bash
+        run: |
+          # Invalid limit should have failed
+          echo "❌ Expected invalid limit to fail"
+          exit 1
+
+      # ---------------------------------------------------------------
+      # 15. Negative: invalid json_fields (trailing comma) must fail.
+      # ---------------------------------------------------------------
+      - name: "Test: invalid json_fields input"
+        id: bad_fields
+        uses: ./
+        continue-on-error: true
+        with:
+          repository: ${{ env.FIXTURE_REPO }}
+          return_type: "json"
+          json_fields: "tagName,"
+
+      - name: "Validate: invalid json_fields was rejected"
+        if: steps.bad_fields.outcome == 'success'
+        shell: bash
+        run: |
+          # Invalid json_fields should have failed
+          echo "❌ Expected invalid json_fields to fail"
+          exit 1
+
+      # ---------------------------------------------------------------
+      # 16. Case-insensitive input normalisation.
+      # ---------------------------------------------------------------
+      - name: "Test: mixed-case inputs are normalised"
+        id: mixed_case
+        uses: ./
+        with:
+          repository: ${{ env.FIXTURE_REPO }}
+          return_type: "JSON"
+          order: "DESC"
+          production_only: "TRUE"
+          json_fields: "tagName"
+
+      - name: "Validate: mixed-case inputs accepted"
+        shell: bash
+        env:
+          RELEASES: ${{ steps.mixed_case.outputs.releases }}
+        run: |
+          # Validate mixed-case normalisation
+          set -euo pipefail
+          if [ -z "$RELEASES" ]; then
+            echo "❌ Expected JSON payload from mixed-case invocation"
+            exit 1
+          fi
+          echo "$RELEASES" | python3 -c 'import json,sys; json.load(sys.stdin)'
+          echo "✅ Mixed-case inputs normalised successfully"
+
+      - name: "Test summary"
+        shell: bash
+        run: |
+          # Test summary
+          echo "### ✅ All action test scenarios passed" \
+            >> "$GITHUB_STEP_SUMMARY"
