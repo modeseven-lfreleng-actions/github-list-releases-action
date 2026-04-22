@@ -57,19 +57,27 @@ jobs:
           echo "Validated local action: ${{ github.repository }}"
           echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
 
-      # yamllint disable-line rule:line-length
-      - name: "Running local action: ${{ github.repository }} [Override Failure]"
+      # Test targeting a remote repository (no checkout required).
+      # The target repository is public and has stable, tagged releases.
+      - name: "Running local action against remote repository"
+        id: remote
         uses: ./
-        id: failure
+        with:
+          REPOSITORY: "lfreleng-actions/test-python-project"
+          SUMMARY_OUTPUT: "true"
+
+      # Negative test: malformed REPOSITORY input must fail fast
+      - name: "Running local action with invalid REPOSITORY"
+        id: remote_failure
+        uses: ./
         continue-on-error: true
         with:
-          invalid_input: "Some garbage"
+          REPOSITORY: "not-a-valid-repo-string"
 
-      # Failure testing is also important
-      - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
+      - name: "Error if invalid REPOSITORY step did NOT fail"
+        if: steps.remote_failure.outcome == 'success'
         shell: bash
         run: |
-          # Error if step above did NOT fail
-          echo "Error: previous test step did NOT fail ❌"
+          # Error if invalid REPOSITORY step did NOT fail
+          echo "Error: invalid REPOSITORY input did NOT fail ❌"
           exit 1

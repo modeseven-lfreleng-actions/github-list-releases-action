@@ -4,7 +4,7 @@
 
 # github-list-releases-action
 name: "📦 List GitHub Releases"
-description: "Returns a list of releases for the current repository"
+description: "Returns a list of releases for a GitHub repository"
 # Limited to 1000 records due to GitHub API query limits
 # 640K ought to be enough for anybody
 # ToDo: investigate support for API query pagination
@@ -35,6 +35,10 @@ inputs:
     description: "Sort order: asc|desc"
     required: false
     default: "desc"
+  REPOSITORY:
+    description: "Target repository in owner/name form (defaults to current)"
+    required: false
+    default: ${{ github.repository }}
   GITHUB_TOKEN:
     description: "GitHub token used to authenticate the GitHub CLI"
     required: false
@@ -87,11 +91,26 @@ runs:
         ORDER=$(echo ${{ inputs.order }} |\
           tr '[:upper:]' '[:lower:]')
         TAG="${{ inputs.tag }}"
+        REPOSITORY="${{ inputs.REPOSITORY }}"
+
+        # Validate repository input (owner/name)
+        if [ -z "$REPOSITORY" ]; then
+          echo "Error: REPOSITORY input is empty ❌"
+          exit 1
+        fi
+        REPO_RE='^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'
+        if ! echo "$REPOSITORY" | grep -Eq "$REPO_RE"; then
+          echo "Error: REPOSITORY must be in 'owner/name' form ❌"
+          echo "Received: $REPOSITORY"
+          exit 1
+        fi
+        echo "Target repository: $REPOSITORY"
 
         # Set baseline flags for the CLI command
         # Note: limit MUST be provided numerically to GH CLI
-        CLI_FLAGS="release list  --limit 1000 -O \
-          ${{ inputs.ORDER }} --limit 1000"
+        # --repo targets an arbitrary repository via the GitHub API and
+        # does NOT require the repository to be checked out locally
+        CLI_FLAGS="release list --repo $REPOSITORY --limit 1000 -O $ORDER"
 
         if [ "f$PRODUCTION_ONLY" = "ffalse" ]; then
           CLI_FLAGS="$CLI_FLAGS --exclude-drafts --exclude-pre-releases"
@@ -122,7 +141,7 @@ runs:
 
         # Only list releases if/when values are returned
         if [ -n "$RELEASES" ]; then
-          echo "Releases in this repository:"
+          echo "Releases in repository $REPOSITORY:"
           echo "$RELEASES"
         fi
 
