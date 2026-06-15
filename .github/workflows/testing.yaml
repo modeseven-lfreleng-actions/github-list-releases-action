@@ -332,7 +332,7 @@ jobs:
 
       # ---------------------------------------------------------------
       # 10. Production-only filter: drafts/pre-releases must be excluded
-      #     when visible in the unfiltered output. v0.2.0 is a draft in
+      #     when visible in the unfiltered output. v0.2.1 is a draft in
       #     the fixture repo; the check is conditional so the test does
       #     not fail if the token cannot see drafts.
       # ---------------------------------------------------------------
@@ -365,7 +365,7 @@ jobs:
           # Only assert draft exclusion if the unfiltered run saw the
           # draft tag. Otherwise the token cannot see drafts and the
           # assertion would be vacuously satisfied anyway.
-          DRAFT_TAG="v0.2.0"
+          DRAFT_TAG="v0.2.1"
           if printf '%s\n' "$UNFILTERED" | grep -Fxq "$DRAFT_TAG"; then
             if printf '%s\n' "$FILTERED" | grep -Fxq "$DRAFT_TAG"; then
               echo "❌ $DRAFT_TAG should be excluded by production_only=true"
