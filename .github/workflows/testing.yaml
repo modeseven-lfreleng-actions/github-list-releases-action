@@ -24,13 +24,22 @@ concurrency:
 
 permissions: {}
 
-# The tests below query a dedicated external fixture repository that
-# contains a stable set of releases (including at least one unprefixed
-# tag such as 0.1.0). Using a fixture repo keeps the assertions
-# deterministic without requiring the CI job to create/destroy
-# repositories or releases.
+# The tests below query a dedicated, FROZEN fixture repository whose
+# release set never changes. The fixture deliberately contains a
+# normal release, an unprefixed-tag release, and a published
+# pre-release, exercising every code path with publicly visible
+# releases. The tests enumerate this matrix dynamically (see the
+# "Enumerate fixture release matrix" step) instead of hard-coding tag
+# names, so tagging releases or merging PRs anywhere never requires
+# editing this workflow.
+#
+# Fixture contents (must remain stable):
+#   v2.0.0       normal, latest
+#   v1.5.0-rc.1  published pre-release (excluded by production_only)
+#   v1.0.0       normal
+#   0.9.0        normal, unprefixed tag
 env:
-  FIXTURE_REPO: "lfreleng-actions/test-python-project"
+  FIXTURE_REPO: "lfreleng-actions/github-releases-test-fixture"
 
 jobs:
   ### Test the GitHub Action in this Repository ###
@@ -49,6 +58,67 @@ jobs:
 
       - name: "Checkout repository"
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # ---------------------------------------------------------------
+      # 0. Enumerate the fixture's release matrix once and derive the
+      #    values later tests need. Deriving them dynamically (rather
+      #    than hard-coding tag strings) is what decouples this suite
+      #    from release activity: nothing here needs editing when new
+      #    releases are tagged or drafted.
+      # ---------------------------------------------------------------
+      - name: "Enumerate fixture release matrix"
+        id: fixture
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Enumerate fixture release matrix (dynamic; no hard-coding)
+          set -euo pipefail
+          MATRIX=$(gh release list --repo "$FIXTURE_REPO" \
+            --json tagName,isDraft,isPrerelease --limit 100)
+          echo "Fixture release matrix:"
+          printf '%s\n' "$MATRIX" | python3 -m json.tool
+
+          # Newest visible normal (non-draft, non-pre-release) tag. The
+          # action accepts both v-prefixed and unprefixed tags, so any
+          # normal tag works for the existence tests below.
+          NORMAL_TAG=$(printf '%s' "$MATRIX" | python3 -c '
+          import json, sys
+          for r in json.load(sys.stdin):
+              if not r["isDraft"] and not r["isPrerelease"]:
+                  print(r["tagName"]); break
+          ')
+          if [ -z "$NORMAL_TAG" ]; then
+            echo "❌ Fixture has no visible normal release"
+            exit 1
+          fi
+
+          # Toggle the v prefix to produce the alternate form. Passing
+          # this exercises the action's bidirectional prefix matching.
+          case "$NORMAL_TAG" in
+            v*) ALT_TAG="${NORMAL_TAG#v}" ;;
+            *)  ALT_TAG="v${NORMAL_TAG}" ;;
+          esac
+
+          # Count visible pre-releases so the production_only test can
+          # assert it is not vacuous (something is actually excluded).
+          PRERELEASE_COUNT=$(printf '%s' "$MATRIX" | python3 -c '
+          import json, sys
+          print(sum(
+              1 for r in json.load(sys.stdin)
+              if r["isPrerelease"] and not r["isDraft"]
+          ))
+          ')
+
+          {
+            echo "normal_tag=$NORMAL_TAG"
+            echo "normal_tag_alt=$ALT_TAG"
+            echo "prerelease_count=$PRERELEASE_COUNT"
+          } >> "$GITHUB_OUTPUT"
+          echo "Derived: normal_tag=$NORMAL_TAG alt=$ALT_TAG" \
+            "visible_prereleases=$PRERELEASE_COUNT"
 
       # ---------------------------------------------------------------
       # 1. Default inputs: current repo, text mode, no tag.
@@ -148,54 +218,57 @@ jobs:
           '
 
       # ---------------------------------------------------------------
-      # 4. Tag checking: an unprefixed tag that exists with a v-prefix
-      #    in the fixture repo. Validates bidirectional matching.
-      #    v0.1.1 is a published (non-draft) release in the fixture repo.
+      # 4. Tag checking: the alternate (v-prefix-toggled) form of an
+      #    existing release. Exercises the action's prefix-toggle
+      #    matching path. The tag is derived dynamically from the
+      #    fixture, so it is never hard-coded.
       # ---------------------------------------------------------------
-      - name: "Test: unprefixed tag matches v-prefixed release"
+      - name: "Test: toggled-prefix tag matches existing release"
         id: tag_unprefixed
         uses: ./
         with:
           repository: ${{ env.FIXTURE_REPO }}
-          tag: "0.1.1"
+          tag: ${{ steps.fixture.outputs.normal_tag_alt }}
 
-      - name: "Validate: unprefixed tag matching"
+      - name: "Validate: toggled-prefix tag matching"
         shell: bash
         env:
           RELEASED: ${{ steps.tag_unprefixed.outputs.released }}
+          TAG: ${{ steps.fixture.outputs.normal_tag_alt }}
         run: |
-          # Validate unprefixed tag matching
+          # Validate toggled-prefix tag matching
           set -euo pipefail
           if [ "$RELEASED" != "true" ]; then
-            echo "❌ Expected released=true for unprefixed tag 0.1.1"
+            echo "❌ Expected released=true for toggled tag $TAG"
             echo "Got: released='$RELEASED'"
             exit 1
           fi
-          echo "✅ Unprefixed tag 0.1.1 matched v-prefixed release"
+          echo "✅ Toggled-prefix tag $TAG matched existing release"
 
       # ---------------------------------------------------------------
-      # 5. Tag checking: v-prefixed form of the same tag.
+      # 5. Tag checking: the exact form of an existing release.
       # ---------------------------------------------------------------
-      - name: "Test: v-prefixed tag matches directly"
+      - name: "Test: exact tag matches directly"
         id: tag_prefixed
         uses: ./
         with:
           repository: ${{ env.FIXTURE_REPO }}
-          tag: "v0.1.1"
+          tag: ${{ steps.fixture.outputs.normal_tag }}
 
-      - name: "Validate: v-prefixed tag matching"
+      - name: "Validate: exact tag matching"
         shell: bash
         env:
           RELEASED: ${{ steps.tag_prefixed.outputs.released }}
+          TAG: ${{ steps.fixture.outputs.normal_tag }}
         run: |
-          # Validate v-prefixed tag matching
+          # Validate exact tag matching
           set -euo pipefail
           if [ "$RELEASED" != "true" ]; then
-            echo "❌ Expected released=true for v-prefixed tag v0.1.1"
+            echo "❌ Expected released=true for exact tag $TAG"
             echo "Got: released='$RELEASED'"
             exit 1
           fi
-          echo "✅ v-prefixed tag v0.1.1 matched directly"
+          echo "✅ Exact tag $TAG matched directly"
 
       # ---------------------------------------------------------------
       # 6. Tag checking: a tag that definitely does not exist.
@@ -231,7 +304,7 @@ jobs:
         uses: ./
         with:
           repository: ${{ env.FIXTURE_REPO }}
-          tag: "v0.1.1"
+          tag: ${{ steps.fixture.outputs.normal_tag }}
           return_type: "json"
           json_fields: "tagName,publishedAt"
 
@@ -240,11 +313,12 @@ jobs:
         env:
           RELEASED: ${{ steps.tag_json.outputs.released }}
           RELEASES: ${{ steps.tag_json.outputs.releases }}
+          TAG: ${{ steps.fixture.outputs.normal_tag }}
         run: |
           # Validate tag checking in JSON mode
           set -euo pipefail
           if [ "$RELEASED" != "true" ]; then
-            echo "❌ Expected released=true for v0.1.1 in JSON mode"
+            echo "❌ Expected released=true for $TAG in JSON mode"
             echo "Got: released='$RELEASED'"
             exit 1
           fi
@@ -331,19 +405,15 @@ jobs:
           echo "✅ limit=2 returned $COUNT release(s)"
 
       # ---------------------------------------------------------------
-      # 10. Production-only filter: drafts/pre-releases must be excluded
-      #     when visible in the unfiltered output. v0.2.1 is a draft in
-      #     the fixture repo; the check is conditional so the test does
-      #     not fail if the token cannot see drafts.
+      # 10. Production-only filter: pre-releases (and drafts) must be
+      #     excluded. The expectation is computed dynamically from gh's
+      #     own view of the fixture, so it can never drift. Drafts are
+      #     not exercised here because the List Releases API only
+      #     returns drafts to tokens with push access, which this
+      #     cross-repo read-only CI token lacks; draft exclusion is
+      #     covered end-to-end by the separate draft_exclusion job.
       # ---------------------------------------------------------------
-      - name: "Test: unfiltered list (to discover draft visibility)"
-        id: unfiltered
-        uses: ./
-        with:
-          repository: ${{ env.FIXTURE_REPO }}
-          production_only: "false"
-
-      - name: "Test: production_only excludes drafts/pre-releases"
+      - name: "Test: production_only excludes pre-releases/drafts"
         id: production_only
         uses: ./
         with:
@@ -353,28 +423,54 @@ jobs:
       - name: "Validate: production_only filtering"
         shell: bash
         env:
-          UNFILTERED: ${{ steps.unfiltered.outputs.releases }}
           FILTERED: ${{ steps.production_only.outputs.releases }}
+          PRERELEASE_COUNT: ${{ steps.fixture.outputs.prerelease_count }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Validate production_only filtering
+          # Validate production_only filtering against gh ground truth
           set -euo pipefail
           if [ -z "$FILTERED" ]; then
-            echo "❌ Expected at least one production release in filtered output"
+            echo "❌ Expected at least one production release in output"
             exit 1
           fi
-          # Only assert draft exclusion if the unfiltered run saw the
-          # draft tag. Otherwise the token cannot see drafts and the
-          # assertion would be vacuously satisfied anyway.
-          DRAFT_TAG="v0.2.1"
-          if printf '%s\n' "$UNFILTERED" | grep -Fxq "$DRAFT_TAG"; then
-            if printf '%s\n' "$FILTERED" | grep -Fxq "$DRAFT_TAG"; then
-              echo "❌ $DRAFT_TAG should be excluded by production_only=true"
+
+          # The frozen fixture always exposes a published pre-release.
+          # If none is visible the fixture has been tampered with and
+          # the exclusion assertion would be vacuous, so fail loudly.
+          if [ "${PRERELEASE_COUNT:-0}" -lt 1 ]; then
+            echo "❌ No visible pre-release in fixture; cannot validate" \
+              "production_only exclusion. Restore the fixture matrix."
+            exit 1
+          fi
+
+          # Ground truth straight from gh: the exact set of tags that a
+          # production-only listing should contain (non-draft AND
+          # non-pre-release), sorted for a stable comparison.
+          EXPECTED=$(gh release list --repo "$FIXTURE_REPO" \
+            --json tagName,isDraft,isPrerelease --limit 100 \
+            -q '.[] | select((.isDraft|not) and (.isPrerelease|not))
+                  | .tagName' | sort)
+          ACTUAL=$(printf '%s\n' "$FILTERED" | sort)
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "❌ production_only output does not match gh ground truth"
+            echo "Expected:"; printf '%s\n' "$EXPECTED"
+            echo "Actual:"; printf '%s\n' "$ACTUAL"
+            exit 1
+          fi
+
+          # Explicitly assert no visible pre-release survived the filter.
+          while IFS= read -r PRE; do
+            [ -z "$PRE" ] && continue
+            if printf '%s\n' "$FILTERED" | grep -Fxq "$PRE"; then
+              echo "❌ Pre-release $PRE must be excluded by production_only"
               exit 1
             fi
-            echo "✅ Draft tag $DRAFT_TAG correctly excluded"
-          else
-            echo "ℹ️ Draft $DRAFT_TAG not visible to token; check skipped"
-          fi
+            echo "✅ Pre-release $PRE correctly excluded"
+          done <<< "$(gh release list --repo "$FIXTURE_REPO" \
+            --json tagName,isDraft,isPrerelease --limit 100 \
+            -q '.[] | select(.isPrerelease and (.isDraft|not)) | .tagName')"
+
+          echo "✅ production_only output matches gh ground truth"
 
       # ---------------------------------------------------------------
       # 11. Negative: invalid repository must fail fast.
@@ -504,3 +600,110 @@ jobs:
           # Test summary
           echo "### ✅ All action test scenarios passed" \
             >> "$GITHUB_STEP_SUMMARY"
+
+  ### End-to-end draft exclusion (cannot run with a read-only token) ###
+  # Drafts are only returned by the List Releases API to tokens with
+  # push access, so they can never be seen by the cross-repo read-only
+  # token used above. This job creates a throwaway draft in THIS repo,
+  # where the workflow token can be granted write access, verifies the
+  # action excludes it under production_only, then deletes it. It is
+  # skipped on pull_request events because fork PRs receive a read-only
+  # token that cannot create releases; draft exclusion is therefore
+  # validated on pushes to main and via manual dispatch.
+  draft_exclusion:
+    name: "Draft exclusion (end-to-end)"
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 10
+    steps:
+      # Harden the runner used by this workflow
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: "Checkout repository"
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: "Create throwaway draft release"
+        id: mkdraft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ github.repository }}
+        run: |
+          # Create an ephemeral draft release to exercise exclusion
+          set -euo pipefail
+          DRAFT_TAG="zz-test-draft-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          # Draft releases do not create a git tag ref until published
+          # (GitHub serves them from an "untagged-*" slug), so this
+          # creates no tag, leaves nothing behind for tag-based workflows
+          # such as tag-push to react to, and needs no tag cleanup.
+          gh release create "$DRAFT_TAG" \
+            --repo "$TARGET_REPO" \
+            --draft \
+            --title "$DRAFT_TAG" \
+            --notes "Ephemeral draft for production_only test; safe to delete"
+          echo "draft_tag=$DRAFT_TAG" >> "$GITHUB_OUTPUT"
+          echo "Created draft release $DRAFT_TAG in $TARGET_REPO"
+
+      - name: "List including drafts (production_only=false)"
+        id: unfiltered
+        uses: ./
+        with:
+          repository: ${{ github.repository }}
+          production_only: "false"
+
+      - name: "List excluding drafts (production_only=true)"
+        id: filtered
+        uses: ./
+        with:
+          repository: ${{ github.repository }}
+          production_only: "true"
+
+      - name: "Validate: draft excluded by production_only"
+        shell: bash
+        env:
+          DRAFT_TAG: ${{ steps.mkdraft.outputs.draft_tag }}
+          UNFILTERED: ${{ steps.unfiltered.outputs.releases }}
+          FILTERED: ${{ steps.filtered.outputs.releases }}
+        run: |
+          # Validate draft exclusion end-to-end
+          set -euo pipefail
+          if ! printf '%s\n' "$UNFILTERED" | grep -Fxq "$DRAFT_TAG"; then
+            echo "❌ Draft $DRAFT_TAG not visible in unfiltered output;" \
+              "cannot validate exclusion (token may lack push access)"
+            exit 1
+          fi
+          if printf '%s\n' "$FILTERED" | grep -Fxq "$DRAFT_TAG"; then
+            echo "❌ Draft $DRAFT_TAG must be excluded by production_only"
+            exit 1
+          fi
+          echo "✅ Draft $DRAFT_TAG correctly excluded by production_only"
+
+      - name: "Cleanup throwaway draft release"
+        if: always() && steps.mkdraft.outputs.draft_tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ github.repository }}
+          DRAFT_TAG: ${{ steps.mkdraft.outputs.draft_tag }}
+        run: |
+          # Remove the ephemeral draft release
+          set -euo pipefail
+          # A draft release never creates a git tag ref (GitHub serves it
+          # from an "untagged-*" slug until published), so only the
+          # release object needs removing. Surface a failure as a visible
+          # warning rather than masking it, but do not fail the job on
+          # cleanup so the test result above stays the primary signal.
+          if gh release delete "$DRAFT_TAG" --repo "$TARGET_REPO" --yes; then
+            echo "Deleted draft release $DRAFT_TAG"
+          else
+            echo "::warning::Could not delete draft release $DRAFT_TAG;" \
+              "no tag ref is created for drafts, so remove the orphaned" \
+              "draft manually from the repository's Releases page"
+          fi
